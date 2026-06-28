@@ -197,9 +197,8 @@ async def send_email(
                 "batches_used": (existing_campaign.sent_to_count + 99) // 100,
             }
         # "sending" or "partial" — the previous attempt did not finish cleanly.
-        # We deliberately do NOT resume: resuming would require tracking which
-        # contacts were already emailed, handling mid-list unsubscribes, and
-        # assigning fresh chunk keys. That's a separate operation.
+        # This request does not continue the failed campaign inline; resuming
+        # is a separate request using resume_from_campaign_id (see below).
         # Return enough info for the caller to decide what to do.
         raise HTTPException(
             status_code=409,
@@ -320,8 +319,11 @@ async def send_email(
     await db.commit()
 
     # ── Send and record chunk by chunk ────────────────────────────────────────
-    # Each chunk gets its own idempotency key so Resend deduplicates individual
-    # batches independently if the outer loop is retried with the same campaign_id.
+    # Each chunk gets its own key derived from campaign_id. Note: no code path
+    # in this service retries a chunk under the same key — the layer-1 check
+    # short-circuits before this loop for any existing campaign_id, and resume
+    # always mints a fresh campaign_id. The keys are structurally correct but
+    # Resend's dedup on them is never exercised in practice. See RETRY_SAFETY.md.
     total_sent = 0
     for i in range(0, len(recipients), 100):
         chunk_recipients = recipients[i : i + 100]

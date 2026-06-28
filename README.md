@@ -125,12 +125,12 @@ pytest
 
 You should see output like:
 ```
-collected 70+ items
+collected 100+ items
 tests/test_customers.py  ............
 tests/test_contacts.py   ......................
-tests/test_email.py      ..............
+tests/test_email.py      .......................
 tests/test_campaigns.py  ..........
-tests/test_webhooks.py   .........
+tests/test_webhooks.py   .............
 ```
 
 ### Playwright end-to-end tests (live server)
@@ -177,6 +177,8 @@ resend-fastapi/
 │   │   └── webhooks.py       # Resend delivery event handler
 │   └── services/
 │       └── resend_service.py # ONLY file that calls Resend API
+├── docs/
+│   └── RETRY_SAFETY.md       # Idempotency design, known limitations, verified behavior
 ├── tests/
 │   ├── conftest.py           # Async DB + mock fixtures for unit tests
 │   ├── test_customers.py
