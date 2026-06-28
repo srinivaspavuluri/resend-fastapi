@@ -216,6 +216,12 @@ Resend monitors your account's bounce rate. High bounce rates lead to account
 suspension. The webhook handler marks bounced/complained contacts as
 `is_subscribed = False` to protect sending reputation.
 
+**How are retries made safe?**
+`/send` accepts an `Idempotency-Key` header and tracks per-recipient send
+status, so a retried request never re-emails a contact who already received
+the campaign. See [docs/RETRY_SAFETY.md](docs/RETRY_SAFETY.md) for the full
+design, including the known limitations that are deliberately not fixed yet.
+
 ---
 
 ## Security Notes

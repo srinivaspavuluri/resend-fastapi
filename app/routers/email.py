@@ -1,12 +1,15 @@
-from fastapi import APIRouter, Depends, HTTPException
+import logging
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, update
 from pydantic import BaseModel, EmailStr, Field
 from typing import Optional
 
+logger = logging.getLogger(__name__)
+
 from ..database import get_db
-from ..models import Customer, Contact, Segment, ContactSegment, Campaign
-from ..services.resend_service import send_single, send_bulk, EmailRecipient
+from ..models import Customer, Contact, Segment, ContactSegment, Campaign, CampaignRecipient, new_id
+from ..services.resend_service import send_single, send_batch, EmailRecipient
 
 router = APIRouter(prefix="/customers", tags=["Send Email"])
 
@@ -51,6 +54,18 @@ class SendEmailRequest(BaseModel):
         ),
         examples=["premium"]
     )
+    resume_from_campaign_id: Optional[str] = Field(
+        None,
+        description=(
+            "Resume a partial campaign. Contacts already present in that campaign's "
+            "recipient list are excluded — only contacts who were NOT emailed in the "
+            "failed campaign will receive this send. "
+            "The referenced campaign must belong to this customer and have status "
+            "'partial' or 'sending'. Obtain the campaign_id from the 409 response "
+            "returned when the original send failed."
+        ),
+        examples=["campaign-uuid-here"]
+    )
 
 
 class SendSingleRequest(BaseModel):
@@ -82,6 +97,7 @@ class SendSingleRequest(BaseModel):
 async def send_email(
     customer_id: str,
     body: SendEmailRequest,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -161,6 +177,45 @@ async def send_email(
             ),
         )
 
+    # ── Idempotency check ─────────────────────────────────────────────────────
+    # The caller's Idempotency-Key becomes the campaign_id.
+    # If no key is supplied we generate one, but then retries are not safe.
+    campaign_id = idempotency_key or new_id()
+
+    # Short-circuit before the expensive contact query: if a campaign with this
+    # ID already exists, the caller is retrying a request we already processed.
+    existing_result = await db.execute(select(Campaign).where(Campaign.id == campaign_id))
+    existing_campaign = existing_result.scalar_one_or_none()
+    if existing_campaign:
+        if existing_campaign.status == "sent":
+            # Clean success from a previous attempt — return cached result, no re-send.
+            return {
+                "success": True,
+                "campaign_id": existing_campaign.id,
+                "sent_to": existing_campaign.sent_to_count,
+                "from": existing_campaign.from_address,
+                "batches_used": (existing_campaign.sent_to_count + 99) // 100,
+            }
+        # "sending" or "partial" — the previous attempt did not finish cleanly.
+        # We deliberately do NOT resume: resuming would require tracking which
+        # contacts were already emailed, handling mid-list unsubscribes, and
+        # assigning fresh chunk keys. That's a separate operation.
+        # Return enough info for the caller to decide what to do.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "A campaign with this Idempotency-Key already exists but did not finish. "
+                    "To send to remaining contacts only (skipping those already emailed), "
+                    "pass this campaign_id as `resume_from_campaign_id` in a new request "
+                    "with a fresh Idempotency-Key."
+                ),
+                "campaign_id": existing_campaign.id,
+                "campaign_status": existing_campaign.status,
+                "sent_to": existing_campaign.sent_to_count,
+            },
+        )
+
     # ── Fetch target contacts ─────────────────────────────────────────────────
     if body.segment_id:
         seg_result = await db.execute(
@@ -192,6 +247,37 @@ async def send_email(
             )
         )
 
+    if body.resume_from_campaign_id:
+        resume_result = await db.execute(
+            select(Campaign).where(
+                and_(
+                    Campaign.id == body.resume_from_campaign_id,
+                    Campaign.customer_id == customer_id,
+                )
+            )
+        )
+        resume_campaign = resume_result.scalar_one_or_none()
+        if not resume_campaign:
+            raise HTTPException(
+                status_code=404,
+                detail="resume_from_campaign_id not found or does not belong to this customer",
+            )
+        if resume_campaign.status != "partial":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Cannot resume a campaign with status '{resume_campaign.status}'. "
+                    "Only 'partial' campaigns can be resumed."
+                ),
+            )
+        already_sent_subq = select(CampaignRecipient.contact_id).where(
+            and_(
+                CampaignRecipient.campaign_id == body.resume_from_campaign_id,
+                CampaignRecipient.contact_id.isnot(None),
+            )
+        )
+        query = query.where(Contact.id.notin_(already_sent_subq))
+
     contacts_result = await db.execute(query)
     contacts = contacts_result.scalars().all()
 
@@ -212,41 +298,90 @@ async def send_email(
         for c in contacts
     ]
 
-    try:
-        results = send_bulk(
-            from_domain=customer.domain_name,
-            recipients=recipients,
-            subject=body.subject,
-            html_template=body.html,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Resend delivery error: {str(e)}")
-
-    # ── Save campaign record ──────────────────────────────────────────────────
     targeting = {}
     if body.segment_id:
         targeting = {"segment_id": body.segment_id}
     elif body.tag:
         targeting = {"tag": body.tag}
 
+    # ── Create Campaign BEFORE sending ────────────────────────────────────────
+    # Committing here means a partial failure mid-loop still leaves a record of
+    # the campaign and whatever chunks succeeded — no silent data loss.
     campaign = Campaign(
+        id=campaign_id,
         customer_id=customer_id,
         subject=body.subject,
-        sent_to_count=len(recipients),
+        sent_to_count=0,
         from_address=f"hello@{customer.domain_name}",
         targeting=targeting,
-        status="sent",
+        status="sending",
     )
     db.add(campaign)
     await db.commit()
-    await db.refresh(campaign)
+
+    # ── Send and record chunk by chunk ────────────────────────────────────────
+    # Each chunk gets its own idempotency key so Resend deduplicates individual
+    # batches independently if the outer loop is retried with the same campaign_id.
+    total_sent = 0
+    for i in range(0, len(recipients), 100):
+        chunk_recipients = recipients[i : i + 100]
+        chunk_contacts = contacts[i : i + 100]
+        chunk_key = f"{campaign_id}/batch-{i // 100}"
+
+        logger.info(
+            "send_batch attempt campaign_id=%s chunk_key=%s contact_ids=%s",
+            campaign_id, chunk_key, [c.id for c in chunk_contacts],
+        )
+
+        try:
+            chunk_results = await send_batch(
+                from_domain=customer.domain_name,
+                recipients=chunk_recipients,
+                subject=body.subject,
+                html_template=body.html,
+                idempotency_key=chunk_key,
+            )
+        except Exception as e:
+            await db.execute(
+                update(Campaign)
+                .where(Campaign.id == campaign_id)
+                .values(status="partial", sent_to_count=total_sent)
+            )
+            await db.commit()
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Resend error on batch {i // 100} "
+                    f"(after {total_sent} emails sent): {str(e)}"
+                ),
+            )
+
+        # Commit each chunk's recipients immediately — if a later chunk fails,
+        # these rows survive and the webhook handler can still flip their statuses.
+        for contact, result in zip(chunk_contacts, chunk_results):
+            db.add(CampaignRecipient(
+                campaign_id=campaign_id,
+                contact_id=contact.id,
+                resend_email_id=result.resend_email_id,
+                status="queued",
+            ))
+        await db.commit()
+        total_sent += len(chunk_results)
+
+    # ── Mark campaign complete ────────────────────────────────────────────────
+    await db.execute(
+        update(Campaign)
+        .where(Campaign.id == campaign_id)
+        .values(status="sent", sent_to_count=total_sent)
+    )
+    await db.commit()
 
     return {
         "success": True,
-        "campaign_id": campaign.id,
-        "sent_to": len(recipients),
+        "campaign_id": campaign_id,
+        "sent_to": total_sent,
         "from": f"hello@{customer.domain_name}",
-        "batches_used": len(results),
+        "batches_used": (total_sent + 99) // 100,
     }
 
 
@@ -254,6 +389,7 @@ async def send_email(
 async def send_single_email(
     customer_id: str,
     body: SendSingleRequest,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -303,11 +439,12 @@ async def send_single_email(
         raise HTTPException(status_code=400, detail="Domain not verified for this customer")
 
     try:
-        resend_result = send_single(
+        resend_result = await send_single(
             from_domain=customer.domain_name,
             to_email=body.to_email,
             subject=body.subject,
             html=body.html,
+            idempotency_key=idempotency_key or "",
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Resend error: {str(e)}")

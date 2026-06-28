@@ -27,6 +27,7 @@ class Customer(Base):
 
     contacts = relationship("Contact", back_populates="customer", cascade="all, delete")
     segments = relationship("Segment", back_populates="customer", cascade="all, delete")
+    campaigns = relationship("Campaign", back_populates="customer", cascade="all, delete")
 
     def __repr__(self):
         return f"<Customer id={self.id} name={self.name} domain={self.domain_name}>"
@@ -97,11 +98,28 @@ class Campaign(Base):
     sent_to_count = Column(Integer, default=0)      # number of recipients
     from_address = Column(String(255))               # e.g. hello@acme.com
     targeting = Column(JSON, default=dict)           # e.g. {"tag": "premium"} or {"segment_id": "..."}
-    status = Column(String(50), default="sent")      # sent | failed
+    status = Column(String(50), default="sending")   # sending | sent | partial | failed
 
     sent_at = Column(DateTime, default=datetime.utcnow)
 
-    customer = relationship("Customer", backref="campaigns")
+    customer = relationship("Customer", back_populates="campaigns")
+    recipients = relationship("CampaignRecipient", back_populates="campaign", cascade="all, delete")
 
     def __repr__(self):
         return f"<Campaign id={self.id} subject={self.subject[:30]} sent_to={self.sent_to_count}>"
+
+
+class CampaignRecipient(Base):
+    """One row per contact per campaign. Populated when the batch call returns email IDs,
+    then updated by the webhook handler as delivery events arrive."""
+    __tablename__ = "campaign_recipients"
+
+    id = Column(String, primary_key=True, default=new_id)
+    campaign_id = Column(String, ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False)
+    contact_id = Column(String, ForeignKey("contacts.id", ondelete="SET NULL"), nullable=True)
+    resend_email_id = Column(String(255), nullable=True, index=True)
+    status = Column(String(50), default="queued")  # queued | sent | delivered | bounced | complained
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+    campaign = relationship("Campaign", back_populates="recipients")
+    contact = relationship("Contact")

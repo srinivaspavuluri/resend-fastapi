@@ -17,12 +17,19 @@ Local development — forward webhooks to localhost:
   npx svix-cli listen http://localhost:8000/webhooks/resend
 """
 import os
+import time
 import hmac
 import hashlib
 import base64
 import logging
-from fastapi import APIRouter, Request, HTTPException, Header
+from datetime import datetime
+from fastapi import APIRouter, Depends, Request, HTTPException, Header
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
+
+from ..database import get_db
+from ..models import CampaignRecipient, Contact
 
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 
@@ -55,6 +62,12 @@ def _verify_svix_signature(
     Svix secrets are prefixed with 'whsec_' and base64 encoded.
     Signed content format: "{svix_id}.{svix_timestamp}.{raw_payload}"
     """
+    try:
+        if abs(int(time.time()) - int(svix_timestamp)) > 300:
+            return False
+    except (ValueError, TypeError):
+        return False
+
     if secret.startswith("whsec_"):
         secret_bytes = base64.b64decode(secret[6:])
     else:
@@ -75,6 +88,7 @@ def _verify_svix_signature(
 @router.post("/resend", summary="Receive Resend delivery event webhooks")
 async def handle_resend_webhook(
     request: Request,
+    db: AsyncSession = Depends(get_db),
     svix_id: Optional[str] = Header(None, alias="svix-id"),
     svix_timestamp: Optional[str] = Header(None, alias="svix-timestamp"),
     svix_signature: Optional[str] = Header(None, alias="svix-signature"),
@@ -156,43 +170,88 @@ async def handle_resend_webhook(
 
     # ── Route by event type ───────────────────────────────────────────────────
 
+    now = datetime.utcnow()
+
     if event_type == "email.sent":
         email_id = data.get("email_id")
-        to = data.get("to", [])
-        print(f"[WEBHOOK] email.sent → id={email_id} to={to}")
-        # TODO: update EmailLog table: status = 'sent'
+        if email_id:
+            await db.execute(
+                update(CampaignRecipient)
+                .where(CampaignRecipient.resend_email_id == email_id)
+                .values(status="sent", updated_at=now)
+            )
+            await db.commit()
 
     elif event_type == "email.delivered":
         email_id = data.get("email_id")
-        print(f"[WEBHOOK] email.delivered → id={email_id}")
-        # TODO: update EmailLog table: status = 'delivered'
+        if email_id:
+            await db.execute(
+                update(CampaignRecipient)
+                .where(CampaignRecipient.resend_email_id == email_id)
+                .values(status="delivered", updated_at=now)
+            )
+            await db.commit()
 
     elif event_type == "email.opened":
         email_id = data.get("email_id")
-        print(f"[WEBHOOK] email.opened → id={email_id}")
-        # TODO: log open event for analytics
+        logger.info(f"[WEBHOOK] email.opened → id={email_id}")
 
     elif event_type == "email.clicked":
         email_id = data.get("email_id")
         link = data.get("click", {}).get("link")
-        print(f"[WEBHOOK] email.clicked → id={email_id} link={link}")
-        # TODO: log click event and which link was clicked
+        logger.info(f"[WEBHOOK] email.clicked → id={email_id} link={link}")
 
     elif event_type == "email.bounced":
-        # Hard bounce — this address is invalid or unreachable
-        # Unsubscribe to protect sender reputation
-        to = data.get("to", [])
-        print(f"[WEBHOOK] email.bounced → {to} — marking as unsubscribed")
-        # TODO: set Contact.is_subscribed = False for each email in `to`
+        email_id = data.get("email_id")
+        if email_id:
+            await db.execute(
+                update(CampaignRecipient)
+                .where(CampaignRecipient.resend_email_id == email_id)
+                .values(status="bounced", updated_at=now)
+            )
+            # Derive contact_id from the CampaignRecipient row rather than
+            # matching on raw email — the latter has no customer_id filter and
+            # would unsubscribe the same address across all tenants.
+            contact_id_subq = (
+                select(CampaignRecipient.contact_id)
+                .where(
+                    CampaignRecipient.resend_email_id == email_id,
+                    CampaignRecipient.contact_id.isnot(None),
+                )
+                .scalar_subquery()
+            )
+            await db.execute(
+                update(Contact)
+                .where(Contact.id == contact_id_subq)
+                .values(is_subscribed=False)
+            )
+            await db.commit()
 
     elif event_type == "email.complained":
-        # Spam complaint — unsubscribe immediately, no exceptions
-        to = data.get("to", [])
-        print(f"[WEBHOOK] email.complained → {to} — unsubscribing immediately")
-        # TODO: set Contact.is_subscribed = False for each email in `to`
+        email_id = data.get("email_id")
+        if email_id:
+            await db.execute(
+                update(CampaignRecipient)
+                .where(CampaignRecipient.resend_email_id == email_id)
+                .values(status="complained", updated_at=now)
+            )
+            contact_id_subq = (
+                select(CampaignRecipient.contact_id)
+                .where(
+                    CampaignRecipient.resend_email_id == email_id,
+                    CampaignRecipient.contact_id.isnot(None),
+                )
+                .scalar_subquery()
+            )
+            await db.execute(
+                update(Contact)
+                .where(Contact.id == contact_id_subq)
+                .values(is_subscribed=False)
+            )
+            await db.commit()
 
     else:
-        print(f"[WEBHOOK] Unhandled event type: {event_type} — ignoring")
+        logger.info(f"[WEBHOOK] Unhandled event type: {event_type} — ignoring")
 
     # Always return 200 — anything else causes Resend to retry
     return {"received": True, "type": event_type}

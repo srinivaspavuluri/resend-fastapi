@@ -1,7 +1,13 @@
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from .database import init_db
 from .routers import customers, contacts, email, webhooks, campaigns
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+)
 
 
 @asynccontextmanager

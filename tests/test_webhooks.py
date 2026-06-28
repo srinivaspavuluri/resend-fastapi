@@ -21,6 +21,7 @@ import base64
 import hashlib
 import hmac
 import json
+import time
 import pytest
 from typing import Optional
 from unittest.mock import patch
@@ -34,7 +35,7 @@ def _make_svix_headers(payload: bytes, secret: str, svix_id: str = "msg_test01")
     Generate valid Svix signature headers for a given payload and secret.
     Mirrors the logic in app/routers/webhooks.py::_verify_svix_signature.
     """
-    svix_timestamp = "1713000000"
+    svix_timestamp = str(int(time.time()))
 
     if secret.startswith("whsec_"):
         secret_bytes = base64.b64decode(secret[6:])

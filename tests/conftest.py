@@ -11,13 +11,14 @@ Key design decisions:
 import pytest
 import pytest_asyncio
 from typing import Optional, List
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 from app.main import app
 from app.database import get_db
 from app.models import Base
+from app.services.resend_service import SendResult
 
 
 # ── In-memory test database ───────────────────────────────────────────────────
@@ -71,15 +72,21 @@ async def client(db_session: AsyncSession):
     })
     mock_verify_domain = MagicMock(return_value={"id": "dom_test123"})
     mock_get_domain_status_verified = MagicMock(return_value={"status": "verified"})
-    mock_send_single = MagicMock(return_value={"id": "email_abc123"})
-    mock_send_bulk = MagicMock(return_value=[{"data": [{"id": "e1"}, {"id": "e2"}]}])
+    mock_send_single = AsyncMock(return_value={"id": "email_abc123"})
+
+    # Returns one SendResult per recipient, in order — mirrors the real send_batch
+    # contract so tests can assert on sent_to counts and CampaignRecipient rows.
+    async def _send_batch_side_effect(from_domain, recipients, subject, html_template, idempotency_key=""):
+        return [SendResult(email=r.email, resend_email_id=f"eid_{i}") for i, r in enumerate(recipients)]
+
+    mock_send_batch = AsyncMock(side_effect=_send_batch_side_effect)
 
     with (
         patch("app.routers.customers.resend_service.add_domain", mock_add_domain),
         patch("app.routers.customers.resend_service.verify_domain", mock_verify_domain),
         patch("app.routers.customers.resend_service.get_domain_status", mock_get_domain_status_verified),
         patch("app.routers.email.send_single", mock_send_single),
-        patch("app.routers.email.send_bulk", mock_send_bulk),
+        patch("app.routers.email.send_batch", mock_send_batch),
     ):
         async with AsyncClient(
             transport=ASGITransport(app=app),
