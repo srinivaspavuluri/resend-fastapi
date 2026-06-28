@@ -1,6 +1,6 @@
 # Security Review — resend-fastapi
 
-Review date: 2026-05-19  
+Review date: 2026-05-19 (updated 2026-06-28)  
 Scope: full codebase (`app/`, configuration files)
 
 ---
@@ -19,6 +19,10 @@ Scope: full codebase (`app/`, configuration files)
 | 8 | 🟡 Medium | Network | No rate limiting — any caller can spam all endpoints | No (add middleware in production) |
 | 9 | 🟢 Low | Logging | Uvicorn access logs include customer/contact IDs in URLs | Informational only |
 | 10 | 🟢 Low | DB | `resend_local.db` written to the project root — risk of committing | ✅ Covered by `.gitignore` |
+| 11 | 🔴 Critical | Multi-tenancy | Bounce/complaint webhook unsubscribed contacts by raw email with no `customer_id` filter — one tenant's bounce could unsubscribe another tenant's contact with the same address | ✅ Fixed |
+| 12 | 🟠 High | Data integrity | `Customer` delete left orphaned `Campaign`/`CampaignRecipient` rows under SQLite (ORM relationship had no cascade; SQLite FK pragma off by default) | ✅ Fixed |
+| 13 | 🟡 Medium | Routing | `GET /customers/{id}/campaigns/{campaign_id}` was registered in two routers; `campaigns.py` version was unreachable dead code | ✅ Fixed |
+| 14 | 🟡 Medium | Security | Svix signature verification had no timestamp freshness check — a captured valid payload could be replayed hours later and still pass | ✅ Fixed (5-minute tolerance) |
 
 ---
 
@@ -140,11 +144,47 @@ Not applied — rate limits are deployment-specific.
 
 ---
 
+### 11 🔴 Cross-Tenant Unsubscribe via Raw Email Match (Critical)
+
+**What:** The bounce and complaint webhook handlers used `Contact.email.in_(to)` to find contacts to unsubscribe — no `customer_id` filter. Because the same email address can legitimately exist as separate Contact rows under different customers, a bounce event on Customer A's send would silently unsubscribe Customer B's contact if they share the same address.
+
+**Fix:** Derive the contact via the `CampaignRecipient` row matched by `resend_email_id`, which carries an explicit `contact_id`. This is inherently scoped to the campaign's customer — no cross-tenant access possible.  
+✅ Applied to both `email.bounced` and `email.complained` handlers in `app/routers/webhooks.py`.
+
+---
+
+### 12 🟠 Customer Delete Leaves Orphaned Campaign Rows (High)
+
+**What:** `Customer.campaigns` used a bare `backref` with no ORM cascade. `delete_customer` claimed to delete "all associated data — contacts, segments, and campaign history," but `Campaign` and `CampaignRecipient` rows were orphaned under SQLite (FK enforcement is off by default; `PRAGMA foreign_keys=ON` was never called). Dev and production (Postgres) would have behaved differently on the same delete path.
+
+**Fix:** Added `cascade="all, delete"` to `Customer.campaigns` in `app/models.py`, matching the existing cascade on `contacts` and `segments`. The ORM now deletes campaigns → recipients in both SQLite and Postgres.  
+✅ Applied to `app/models.py`.
+
+---
+
+### 13 🟡 Duplicate Route — Dead Code Trap (Medium)
+
+**What:** `GET /customers/{id}/campaigns/{campaign_id}` was defined in both `app/routers/customers.py` and `app/routers/campaigns.py`. FastAPI registered the `customers.py` version first, making the `campaigns.py` copy permanently unreachable. Editing the campaigns.py version would have had no effect, with no error or warning.
+
+**Fix:** Removed the route from `customers.py`. The canonical version now lives exclusively in `campaigns.py`, where campaign routes belong.  
+✅ Applied.
+
+---
+
+### 14 🟡 Svix Signature — No Timestamp Freshness Check (Medium)
+
+**What:** `_verify_svix_signature` verified the HMAC correctly but never validated `svix_timestamp` against a tolerance window. A captured valid request (payload + signature) could be replayed arbitrarily later and still pass verification.
+
+**Fix:** Added a 5-minute freshness check on `svix_timestamp` before the HMAC comparison. Requests older than 300 seconds are rejected regardless of signature validity.  
+✅ Applied to `app/routers/webhooks.py`. Test helper updated to generate current timestamps (was hardcoded to April 2024).
+
+---
+
 ## What's Done Well
 
 - **UUIDs for all IDs** — customer, contact, segment, and campaign IDs are UUIDs (not sequential integers), making enumeration attacks much harder.
 - **ORM throughout** — all database access goes through SQLAlchemy ORM. No raw string SQL, so SQL injection risk is minimal.
 - **Webhook signature verification** — Svix HMAC-SHA256 signature checking is implemented correctly (compare_digest to avoid timing attacks).
-- **Unsubscribe on bounce/complaint** — protects Resend sender reputation automatically.
+- **Unsubscribe on bounce/complaint** — protects Resend sender reputation automatically. Scoped via `CampaignRecipient.contact_id` (not raw email) to prevent cross-tenant side effects (see finding #11).
 - **Pydantic v2 validation** — all request bodies are validated before reaching business logic; invalid email formats, missing required fields, and wrong types are rejected automatically.
 - **No secrets in source code** — all keys loaded from environment variables / `.env`.
